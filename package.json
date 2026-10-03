@@ -1,0 +1,32 @@
+{
+  "name": "qwen-agent",
+  "version": "1.3.0",
+  "description": "Qwen Agent V13 - local Ollama coding and cowork-style desktop agent",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "dist": "electron-builder --mac",
+    "dist:dmg": "electron-builder --mac dmg"
+  },
+  "devDependencies": {
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "com.rahul.qwenagent",
+    "productName": "Qwen Agent",
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg"
+      ]
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "README.md"
+    ],
+    "artifactName": "Qwen-Agent-${version}-${arch}.${ext}"
+  }
+}
