@@ -177,6 +177,12 @@ ipcMain.handle('dev-update',async()=>{
   if(!pull.ok)return pull;
   const install=await runShell('npm install',300000);
   if(!install.ok)return install;
+
+  setTimeout(()=>{
+    app.relaunch();
+    app.exit(0);
+  },700);
+
   return {ok:true,output:[pull.output,install.output,'Update installed. Restarting Qwen Agent…'].filter(Boolean).join('\n')};
 });
 
