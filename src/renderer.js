@@ -64,6 +64,176 @@ if(name==='run_parallel_background'){if(mode==='plan')return{denied:true,reason:
 if(name==='get_task_status'){const id=String(args.task_id||'');const t=(window._tasks||[]).find(x=>x.backgroundId===id)||null;if(t)return{taskId:id,state:t.state,label:t.label,command:t.command,recentOutput:(t.events||[]).slice(-12)};return await window.qwen.backgroundStatus(id)}
 return{error:'Unknown tool '+name}}catch(e){log(`✗ ${name}: ${e.message}`);return{error:e.message}}}
 
+
+function parseToolArguments(raw){
+  if(raw && typeof raw === 'object') return raw;
+  if(!raw) return {};
+  let text=String(raw).trim();
+
+  // Remove common markdown fences.
+  text=text.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');
+
+  try{return JSON.parse(text)}catch{}
+
+  // Some Qwen outputs use Python-ish single quotes.
+  try{
+    const normalized=text
+      .replace(/([{,]\s*)'([^']+?)'\s*:/g,'$1"$2":')
+      .replace(/:\s*'([^']*)'/g,':"$1"');
+    return JSON.parse(normalized);
+  }catch{}
+
+  return {};
+}
+
+function normalizeOneToolCall(name,args){
+  name=String(name||'').trim();
+  if(!name)return null;
+
+  let parsedArgs={};
+
+  if(args && typeof args==='object'){
+    parsedArgs=args;
+  }else if(typeof args==='string'){
+    const text=args.trim();
+    if(text){
+      try{
+        parsedArgs=JSON.parse(text);
+      }catch{
+        // Never send malformed JSON to Ollama.
+        return null;
+      }
+    }
+  }
+
+  if(!parsedArgs || typeof parsedArgs!=='object' || Array.isArray(parsedArgs)){
+    return null;
+  }
+
+  return {
+    id:`call_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    type:'function',
+    function:{
+      name,
+      arguments:parsedArgs
+    }
+  };
+}
+
+function parseToolCalls(text){
+  const source=String(text||'');
+  const calls=[];
+
+  // <tool_call>{"name":"list_files","arguments":{...}}</tool_call>
+  for(const m of source.matchAll(/<tool_call\b[^>]*>([\s\S]*?)<\/tool_call>/gi)){
+    const body=m[1].trim();
+    try{
+      const obj=JSON.parse(body);
+      const c=normalizeOneToolCall(
+        obj.name||obj.function?.name,
+        obj.arguments??obj.function?.arguments??{}
+      );
+      if(c)calls.push(c);
+    }catch{
+      const name=body.match(/["']?name["']?\s*:\s*["']([^"']+)["']/i)?.[1];
+      const args=body.match(/["']?arguments["']?\s*:\s*(\{[\s\S]*\})/i)?.[1];
+      const c=normalizeOneToolCall(name,args||{});
+      if(c)calls.push(c);
+    }
+  }
+
+  // <function=list_files>...</function>
+  for(const m of source.matchAll(/<function\s*=\s*([A-Za-z0-9_.:-]+)\s*>([\s\S]*?)<\/function>/gi)){
+    const name=m[1];
+    const body=m[2].trim();
+    let args=parseToolArguments(body);
+
+    // Handle <parameter=foo>bar</parameter>
+    if(!Object.keys(args).length){
+      const params={};
+      for(const pm of body.matchAll(/<parameter\s*=\s*([^>]+)>([\s\S]*?)<\/parameter>/gi)){
+        params[pm[1].trim()]=pm[2].trim();
+      }
+      args=params;
+    }
+
+    const c=normalizeOneToolCall(name,args);
+    if(c)calls.push(c);
+  }
+
+  // Bare JSON tool call.
+  for(const m of source.matchAll(/\{[\s\S]*?"(?:name|function)"\s*:[\s\S]*?\}/g)){
+    try{
+      const obj=JSON.parse(m[0]);
+      const c=normalizeOneToolCall(
+        obj.name||obj.function?.name,
+        obj.arguments??obj.function?.arguments??{}
+      );
+      if(c && !calls.some(x=>x.function.name===c.function.name &&
+        x.function.arguments===c.function.arguments)) calls.push(c);
+    }catch{}
+  }
+
+  // Remove duplicate calls.
+  return calls.filter((c,i,a)=>i===a.findIndex(x=>
+    x.function.name===c.function.name &&
+    x.function.arguments===c.function.arguments
+  ));
+}
+
+function stripToolSyntax(text){
+  return String(text||'')
+    .replace(/<tool_call\b[^>]*>[\s\S]*?<\/tool_call>/gi,'')
+    .replace(/<function\s*=[^>]+>[\s\S]*?<\/function>/gi,'')
+    .trim();
+}
+
+function normalizeModelToolCalls(message, streamedText=''){
+  const native=Array.isArray(message?.tool_calls)?message.tool_calls:[];
+  const textual=parseToolCalls(
+    `${message?.content||''}\n${streamedText||''}`
+  );
+
+  const calls=[];
+
+  for(const c of native){
+    const name=String(c?.function?.name||'').trim();
+    if(!name)continue;
+
+    let args={};
+    try{
+      const raw=c?.function?.arguments;
+      args=raw && typeof raw==='object'
+        ? raw
+        : raw
+          ? JSON.parse(String(raw))
+          : {};
+    }catch{
+      log(`✗ Ignoring malformed native tool call: ${name}`);
+      continue;
+    }
+
+    const normalized=normalizeOneToolCall(name,args);
+    if(normalized)calls.push(normalized);
+  }
+
+  for(const c of textual){
+    if(!c?.function?.name)continue;
+
+    const duplicate=calls.some(x=>
+      x.function.name===c.function.name &&
+      String(x.function.arguments||'')===String(c.function.arguments||'')
+    );
+
+    if(!duplicate)calls.push(c);
+  }
+
+  return {
+    calls,
+    cleanContent:stripToolSyntax(message?.content||streamedText||'')
+  };
+}
+
 async function agentLoop(userText){
   if(!projectRoot){add('system','Choose a project folder first.');return}
   if(busy)return;
@@ -78,10 +248,37 @@ async function agentLoop(userText){
     const safeParallel=new Set(['list_files','read_file','search_files','search_content','get_project_context','workspace_status','web_search','fetch_url','github_search','npm_info','get_task_status']);
     for(let step=0;step<40&&!stopRequested;step++){
       log(`Model step ${step+1}`);let liveText='';document.querySelector('.msg.live')?.remove();
-      const off=window.qwen.onChatChunk(({chunk})=>{const c=chunk?.message?.content||'';if(c){liveText+=c;let el=document.querySelector('.msg.live');if(!el){el=add('assistant','');el.classList.add('live')}el.textContent=liveText}});
+      const off=window.qwen.onChatChunk(({chunk})=>{const c=chunk?.message?.content||'';if(c){
+          liveText+=c;
+          const visible=stripToolSyntax(liveText);
+          let el=document.querySelector('.msg.live');
+          if(visible){
+            if(!el){el=add('assistant','');el.classList.add('live')}
+            el.textContent=visible;
+          }else if(el){
+            el.textContent='';
+          }
+        }});
       let r;try{r=await window.qwen.chatStream({model:config.model,messages:[{role:'system',content:buildSystemPrompt()},...messages],tools:toolDefs,options:{num_ctx:65536,temperature:.2}})}finally{off()}
       document.querySelector('.msg.live')?.classList.remove('live');
-      const m=r.message||{},calls=Array.isArray(m.tool_calls)?m.tool_calls:[];const am={role:'assistant',content:m.content||liveText};if(calls.length)am.tool_calls=calls;messages.push(am);
+      const m=r.message||{};
+      const normalizedTools=normalizeModelToolCalls(m,liveText);
+      const calls=normalizedTools.calls;
+      const cleanContent=normalizedTools.cleanContent;
+      const am={role:'assistant',content:cleanContent};
+
+      if(calls.length){
+        am.tool_calls=calls.map(c=>({
+          id:c.id,
+          type:'function',
+          function:{
+            name:String(c.function?.name||''),
+            arguments:c.function?.arguments || {}
+          }
+        }));
+      }
+
+      messages.push(am);
       if(!calls.length){
         const refusal=/restricted environment|cannot (create|modify|access) files|file operations (are|is) (disabled|limited)|no project folder|unable to (create|modify) files|can't (create|modify) files/i.test(m.content||liveText);
         if(refusal&&projectRoot&&step<3){messages.push({role:'user',content:'You are running inside a desktop app with a real selected project root and executable tools. Do not describe limitations. Use workspace_status first, then perform the requested task with the appropriate tool.'});log('Model refused tool use; sending workspace/tool-use correction');continue}
@@ -95,7 +292,15 @@ async function agentLoop(userText){
         const results=group.length>1?await Promise.all(group.map(executeTool)):[await executeTool(group[0])];
         for(let gi=0;gi<group.length;gi++){
           const call=group[gi],result=results[gi],resultText=normalized(result);
-          messages.push({role:'tool',tool_name:call.function?.name||'unknown',content:resultText});
+          const toolName=call.function?.name||'unknown';
+          const toolCallId=call.id||call.tool_call_id||`call_${Date.now()}_${gi}`;
+
+          messages.push({
+            role:'tool',
+            tool_call_id:toolCallId,
+            name:toolName,
+            content:String(resultText)
+          });
           if(!result.ok&&result.error){const signature=String(result.error);if(signature===lastError)repeatedErrors++;else{lastError=signature;repeatedErrors=1}if(repeatedErrors>=3){log('Stopped repeated identical errors');add('system',`Stopped after 3 identical errors: ${signature}`);stopRequested=true;break}}
           else if(result.ok)repeatedErrors=0;
           if(['write_file','edit_file'].includes(call.function?.name)&&result.ok)currentTask.changes.push(call.function.arguments?.path||'unknown');
